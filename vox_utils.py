@@ -682,6 +682,195 @@ def detect_gaps(model: VoxelModel, x1: int, y1: int, z1: int, x2: int, y2: int, 
     return gaps
 
 
+def calculate_human_proportions(total_height: int, style: str = "standard") -> Dict[str, int]:
+    """Calculate proper human body proportions based on the 8-heads-tall rule.
+    
+    Args:
+        total_height: Total height of the character in voxels
+        style: "standard" (8 heads), "minecraft" (Minecraft player), "heroic" (9 heads), "chibi" (4-5 heads)
+    
+    Returns:
+        Dictionary with body part dimensions in voxels
+    """
+    if style == "minecraft":
+        # Minecraft player: ~1.875 blocks tall, but model is 32 voxels
+        # Head: 8 voxels, Torso: 12, Legs: 12
+        head_height = max(1, total_height // 4)  # Head is 1/4 of height in Minecraft
+        neck_height = max(1, total_height // 32)
+        torso_height = max(1, total_height * 3 // 8)
+        leg_height = max(1, total_height * 3 // 8)
+        arm_length = max(1, total_height * 3 // 8)
+    elif style == "heroic":
+        # Heroic proportions: 9 heads tall
+        head_height = max(1, total_height // 9)
+        neck_height = max(1, total_height // 36)
+        torso_height = max(1, total_height * 3 // 9)
+        leg_height = max(1, total_height * 4 // 9)
+        arm_length = max(1, total_height * 3 // 9)
+    elif style == "chibi":
+        # Chibi/cute style: 4-5 heads tall
+        head_height = max(1, total_height // 4)
+        neck_height = max(1, total_height // 20)
+        torso_height = max(1, total_height // 4)
+        leg_height = max(1, total_height // 4)
+        arm_length = max(1, total_height // 4)
+    else:  # standard
+        # Standard human: 8 heads tall
+        head_height = max(1, total_height // 8)
+        neck_height = max(1, total_height // 32)
+        torso_height = max(1, total_height * 3 // 8)  # 3 heads
+        leg_height = max(1, total_height // 2)  # 4 heads
+        arm_length = max(1, total_height * 3 // 8)  # 3 heads
+    
+    return {
+        'head': head_height,
+        'neck': neck_height,
+        'torso': torso_height,
+        'legs': leg_height,
+        'arms': arm_length,
+        'total': total_height
+    }
+
+
+def calculate_minecraft_proportions() -> Dict[str, float]:
+    """Calculate Minecraft-specific proportions based on official measurements.
+    
+    Returns:
+        Dictionary with Minecraft measurements in blocks/meters
+    """
+    return {
+        'player_height_standing': 1.8,  # blocks (1.8 meters)
+        'player_height_sneaking': 1.5,  # blocks
+        'player_height_swimming': 0.6,  # blocks
+        'player_width': 0.6,  # blocks
+        'eye_height_standing': 1.62,  # meters above base
+        'eye_height_sneaking': 1.27,  # meters above base
+        'block_size': 1.0,  # 1 block = 1 meter
+        'pixels_per_block': 16,  # texture resolution
+        'meters_per_pixel': 0.0625,  # 1/16 meter per pixel
+        'player_model_height_voxels': 32,  # standard Minecraft skin height
+        'head_voxels': 8,
+        'torso_voxels': 12,
+        'legs_voxels': 12
+    }
+
+
+def check_proportions(model: VoxelModel, part_name: str, dimensions: Tuple[int, int, int], 
+                     model_height: Optional[int] = None, style: str = "standard") -> Optional[str]:
+    """Check if body part dimensions are proportional to the overall model.
+    
+    Args:
+        model: The voxel model
+        part_name: Name of the body part ("head", "torso", "legs", "arms", etc.)
+        dimensions: (width, height, depth) of the part
+        model_height: Total model height in voxels (if None, calculated from model)
+        style: Proportion style ("standard", "minecraft", "heroic", "chibi")
+    
+    Returns:
+        Warning string if disproportionate, None if OK
+    """
+    # Calculate model height if not provided
+    if model_height is None:
+        if not model.voxels:
+            return None  # Can't check proportions of empty model
+        all_y = [y for (x, y, z) in model.voxels.keys()]
+        if not all_y:
+            return None
+        model_height = max(all_y) - min(all_y) + 1
+    
+    if model_height < 4:
+        return None  # Too small to check proportions
+    
+    # Get expected proportions
+    proportions = calculate_human_proportions(model_height, style)
+    
+    part_width, part_height, part_depth = dimensions
+    
+    # Check specific body parts
+    if part_name.lower() == "head":
+        expected_height = proportions['head']
+        if part_height > expected_height * 1.5:
+            return (f"Warning: {part_name} height ({part_height} voxels) is too large. "
+                   f"Expected ~{expected_height} voxels for {model_height}-voxel {style} character "
+                   f"({part_height/expected_height:.1f}x expected size).")
+        elif part_height < expected_height * 0.5:
+            return (f"Warning: {part_name} height ({part_height} voxels) is too small. "
+                   f"Expected ~{expected_height} voxels for {model_height}-voxel {style} character.")
+    
+    elif part_name.lower() == "torso":
+        expected_height = proportions['torso']
+        if part_height > expected_height * 1.5:
+            return (f"Warning: {part_name} height ({part_height} voxels) is too large. "
+                   f"Expected ~{expected_height} voxels for {model_height}-voxel {style} character.")
+        elif part_height < expected_height * 0.5:
+            return (f"Warning: {part_name} height ({part_height} voxels) is too small. "
+                   f"Expected ~{expected_height} voxels for {model_height}-voxel {style} character.")
+    
+    elif part_name.lower() in ["legs", "leg"]:
+        expected_height = proportions['legs']
+        if part_height > expected_height * 1.5:
+            return (f"Warning: {part_name} height ({part_height} voxels) is too large. "
+                   f"Expected ~{expected_height} voxels for {model_height}-voxel {style} character.")
+        elif part_height < expected_height * 0.5:
+            return (f"Warning: {part_name} height ({part_height} voxels) is too small. "
+                   f"Expected ~{expected_height} voxels for {model_height}-voxel {style} character.")
+    
+    elif part_name.lower() in ["arms", "arm"]:
+        expected_length = proportions['arms']
+        # For arms, check the longest dimension (could be width, height, or depth)
+        max_dim = max(part_width, part_height, part_depth)
+        if max_dim > expected_length * 1.5:
+            return (f"Warning: {part_name} length ({max_dim} voxels) is too long. "
+                   f"Expected ~{expected_length} voxels for {model_height}-voxel {style} character.")
+        elif max_dim < expected_length * 0.5:
+            return (f"Warning: {part_name} length ({max_dim} voxels) is too short. "
+                   f"Expected ~{expected_length} voxels for {model_height}-voxel {style} character.")
+    
+    return None  # Proportions are OK
+
+
+def suggest_proportions(model_height: int, style: str = "standard") -> Dict[str, Dict[str, int]]:
+    """Suggest proper proportions for a character model.
+    
+    Args:
+        model_height: Total height of the character in voxels
+        style: Proportion style ("standard", "minecraft", "heroic", "chibi")
+    
+    Returns:
+        Dictionary with suggested dimensions for each body part
+    """
+    proportions = calculate_human_proportions(model_height, style)
+    
+    return {
+        'head': {
+            'height': proportions['head'],
+            'width': proportions['head'],
+            'depth': proportions['head'],
+            'radius': proportions['head'] // 2
+        },
+        'neck': {
+            'height': proportions['neck'],
+            'width': max(1, proportions['head'] * 2 // 3),
+            'depth': max(1, proportions['head'] * 2 // 3)
+        },
+        'torso': {
+            'height': proportions['torso'],
+            'width': max(1, proportions['head'] * 2),
+            'depth': max(1, proportions['head'] * 1.5)
+        },
+        'legs': {
+            'height': proportions['legs'],
+            'width': max(1, proportions['head'] * 1.5),
+            'depth': max(1, proportions['head'] * 1.5)
+        },
+        'arms': {
+            'length': proportions['arms'],
+            'width': max(1, proportions['head'] * 3 // 4),
+            'depth': max(1, proportions['head'] * 3 // 4)
+        }
+    }
+
+
 def suggest_connection_fix(model: VoxelModel, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> Optional[str]:
     """Suggest how to fix a connection issue.
     Returns a suggestion string or None if no fix needed."""

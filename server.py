@@ -14,7 +14,9 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from vox_utils import VoxelModel, read_vox_file, write_vox_file, check_connection, detect_gaps, suggest_connection_fix
+from vox_utils import (VoxelModel, read_vox_file, write_vox_file, check_connection, 
+                       detect_gaps, suggest_connection_fix, check_proportions, 
+                       calculate_human_proportions, suggest_proportions, calculate_minecraft_proportions)
 
 # Import intelligence layer
 try:
@@ -190,6 +192,26 @@ async def list_tools() -> list[Tool]:
                     }
                 },
                 "required": ["filename"]
+            }
+        ),
+        Tool(
+            name="get_proportion_suggestions",
+            description="Get suggested body part proportions for a character model based on standard human proportions (8 heads tall) or Minecraft proportions",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "model_height": {
+                        "type": "integer",
+                        "description": "Total height of the character model in voxels"
+                    },
+                    "style": {
+                        "type": "string",
+                        "description": "Proportion style: 'standard' (8 heads), 'minecraft' (Minecraft player), 'heroic' (9 heads), 'chibi' (4-5 heads)",
+                        "default": "standard",
+                        "enum": ["standard", "minecraft", "heroic", "chibi"]
+                    }
+                },
+                "required": ["model_height"]
             }
         ),
         Tool(
@@ -782,6 +804,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             model.fill_box(x1, y1, z1, x2, y2, z2, color_index)
             count = (abs(x2 - x1) + 1) * (abs(y2 - y1) + 1) * (abs(z2 - z1) + 1)
             
+            # Store box dimensions for proportion checking
+            box_width = abs(x2 - x1) + 1
+            box_height = abs(y2 - y1) + 1
+            box_depth = abs(z2 - z1) + 1
+            
             # Check for gaps after filling
             if has_existing:
                 gaps = detect_gaps(model, x1, y1, z1, x2, y2, z2)
@@ -790,6 +817,33 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     if len(gaps) > 3:
                         gap_str += f" (+{len(gaps)-3} more)"
                     warnings.append(f"Detected {len(gaps)}-voxel gap(s) at {gap_str}. Consider filling gaps for better connection.")
+                
+                # Check proportions for body parts (if box is vertical and tall, might be torso/legs)
+                box_height = abs(y2 - y1) + 1
+                box_width = abs(x2 - x1) + 1
+                box_depth = abs(z2 - z1) + 1
+                
+                if box_height > 4 and box_width <= 6 and box_depth <= 6:  # Vertical box, might be body part
+                    all_y = [y for (x, y, z) in model.voxels.keys()]
+                    if all_y:
+                        model_height = max(all_y) - min(all_y) + 1
+                        # Determine if this might be a body part based on position
+                        box_center_y = (y1 + y2) // 2
+                        model_top = max(all_y)
+                        model_bottom = min(all_y)
+                        
+                        # If box is in upper third, might be torso
+                        if box_center_y > (model_top + model_bottom) * 2 // 3:
+                            prop_warning = check_proportions(model, "torso", (box_width, box_height, box_depth), 
+                                                            model_height, style="standard")
+                            if prop_warning:
+                                warnings.append(prop_warning)
+                        # If box is in lower third, might be legs
+                        elif box_center_y < (model_top + model_bottom) // 3:
+                            prop_warning = check_proportions(model, "legs", (box_width, box_height, box_depth), 
+                                                            model_height, style="standard")
+                            if prop_warning:
+                                warnings.append(prop_warning)
             
             # Write back
             write_vox_file(filepath, model)
@@ -865,6 +919,38 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             return [TextContent(
                 type="text",
                 text=f"Error getting model info: {str(e)}"
+            )]
+    
+    elif name == "get_proportion_suggestions":
+        model_height = arguments["model_height"]
+        style = arguments.get("style", "standard")
+        
+        try:
+            suggestions = suggest_proportions(model_height, style)
+            mc_props = calculate_minecraft_proportions()
+            
+            result_text = f"Proportion suggestions for {model_height}-voxel {style} character:\n\n"
+            result_text += "Body Part Dimensions:\n"
+            for part, dims in suggestions.items():
+                if part == 'head':
+                    result_text += f"  {part.capitalize()}: {dims['height']}×{dims['width']}×{dims['depth']} voxels (radius: {dims['radius']})\n"
+                elif part == 'arms':
+                    result_text += f"  {part.capitalize()}: {dims['length']}×{dims['width']}×{dims['depth']} voxels\n"
+                else:
+                    result_text += f"  {part.capitalize()}: {dims['height']}×{dims['width']}×{dims['depth']} voxels\n"
+            
+            if style == "minecraft":
+                result_text += f"\nMinecraft Reference:\n"
+                result_text += f"  Player height: {mc_props['player_height_standing']} blocks (standing)\n"
+                result_text += f"  Player width: {mc_props['player_width']} blocks\n"
+                result_text += f"  Eye height: {mc_props['eye_height_standing']} meters\n"
+                result_text += f"  Standard skin: {mc_props['player_model_height_voxels']} voxels tall\n"
+            
+            return [TextContent(type="text", text=result_text)]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error getting proportion suggestions: {str(e)}"
             )]
     
     elif name == "create_sphere":

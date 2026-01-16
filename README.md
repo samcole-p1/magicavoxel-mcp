@@ -138,6 +138,24 @@ The server works directly with .vox files in the configured `vox/` directory. Ch
 - **Model limits**: MagicaVoxel supports models up to 256×256×256 voxels
 - **File format**: The server implements basic .vox file reading/writing. Complex features like materials and animations may require manual editing in MagicaVoxel.
 
+## Direct Function Usage
+
+**Recommended Approach**: Use MCP tool functions directly via Python one-liners rather than creating standalone scripts.
+
+**Example:**
+```python
+# Direct function usage (recommended)
+python -c "import sys; sys.path.insert(0, 'magicavoxel-mcp'); from vox_utils import VoxelModel, write_vox_file; from pathlib import Path; model = VoxelModel(10,10,10); model.fill_box(0,0,0,5,5,5,1); write_vox_file(Path('vox/model.vox'), model)"
+```
+
+**Why:**
+- MCP tools are designed to be used directly through the MCP protocol
+- Direct function calls are faster and more efficient
+- Keeps workflow consistent with MCP tool usage patterns
+- No need for intermediate script files
+
+**Alternative**: You can also use the MCP tools through Cursor's natural language interface, which will call the tools automatically.
+
 ## Troubleshooting
 
 - If models don't appear in MagicaVoxel, make sure the `VOX_DIR` path is correct
