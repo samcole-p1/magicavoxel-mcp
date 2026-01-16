@@ -10,6 +10,9 @@ An MCP (Model Context Protocol) server for interacting with MagicaVoxel .vox fil
 - Fill rectangular regions with voxels
 - List available models
 - Get detailed model information
+- **Local Machine Learning** - Automatic quality prediction (runs entirely on your machine!)
+- **Intelligent Suggestions** - ML-powered parameter suggestions based on your successful models
+- **Auto-Learning** - System learns from your models and improves over time
 
 ## Installation
 
@@ -18,6 +21,8 @@ An MCP (Model Context Protocol) server for interacting with MagicaVoxel .vox fil
 cd magicavoxel-mcp
 pip install -r requirements.txt
 ```
+
+**Note**: The ML features require `scikit-learn`, `numpy`, and `joblib` which are included in requirements.txt. If you only need basic features, the ML system is optional and will gracefully degrade.
 
 2. Configure the MCP server in your Cursor settings. 
 
@@ -121,8 +126,12 @@ Once configured, you can use natural language prompts like:
 ### Intelligence Features (Optional)
 - `smart_create_model` - Intelligently create a voxel model with template support
 - `get_suggestions` - Get intelligent suggestions for next operations
+- `get_smart_suggestions` - Get ML-powered parameter suggestions based on learned patterns
 - `list_templates` - List available templates for model creation
 - `get_operation_stats` - Get statistics about operations performed
+- `analyze_item` - Analyze models with automatic validation and ML quality prediction
+- `train_ml_model` - Train local machine learning models from your model history
+- `get_proportion_suggestions` - Get suggested body part proportions for characters
 
 ## File Structure
 
