@@ -3,7 +3,10 @@ Utility functions for working with .vox files
 Handles reading, writing, and manipulating MagicaVoxel .vox format
 """
 
+import os
 import struct
+import tempfile
+from collections import deque
 from typing import List, Tuple, Optional, Dict
 from pathlib import Path
 
@@ -14,19 +17,65 @@ except ImportError:
     PIL_AVAILABLE = False
 
 
+# A .vox model is at most 256 voxels along each axis; coordinates are 0-255.
+GRID = 256
+NEIGHBORS = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+# Most voxels one model or one fill may hold (e.g. 256x128x128); a full 256^3 grid would need ~2 GB
+MAX_VOXELS = 1 << 22
+
+
+def _span(a: int, b: int) -> range:
+    """Inclusive range between a and b, clamped to the grid"""
+    return range(max(0, min(a, b)), min(GRID - 1, max(a, b)) + 1)
+
+
+def _check_volume(*spans: range):
+    volume = len(spans[0]) * len(spans[1]) * len(spans[2])
+    if volume > MAX_VOXELS:
+        raise ValueError(f"Region of {volume} voxels is larger than the {MAX_VOXELS} allowed in one operation")
+
+
+def _check_color(color_index: int):
+    if not 0 <= color_index <= 255:
+        raise ValueError(f"Color index {color_index} is outside 0-255")
+
+
 class VoxelModel:
-    """Represents a voxel model"""
-    
+    """Represents a voxel model. Z is up, matching MagicaVoxel."""
+
     def __init__(self, size_x: int = 0, size_y: int = 0, size_z: int = 0):
+        for size in (size_x, size_y, size_z):
+            if not 0 <= size <= GRID:
+                raise ValueError(f"Model size {size} is outside 0-{GRID}")
         self.size_x = size_x
         self.size_y = size_y
         self.size_z = size_z
         self.voxels: dict[Tuple[int, int, int], int] = {}  # (x, y, z) -> color_index
+        # palette[i] is the colour of index i; palette[0] is unused (empty)
         self.palette = self._default_palette()
-    
+        # Non-zero when edits since loading dropped voxels outside the grid (a count where known)
+        self.clipped = 0
+        # Chunk layout from the file this model was read from (see read_vox_file)
+        self.version = 150
+        self.layout: list = ["MODEL", "RGBA"]
+        self.model_count = 1
+        # The RGBA chunk's 256th entry maps to no colour index; kept so files round-trip exactly
+        self.spare_rgba = bytes(4)
+        # SIZE as read from the file, and how far edits have moved the voxels since
+        # (new = old + shift); used to keep a scene's placement when the size changes
+        self.loaded_size: Optional[Tuple[int, int, int]] = None
+        self.loaded_count = 0
+        self.shift = (0, 0, 0)
+
+    def file_size(self) -> Tuple[int, int, int]:
+        """The SIZE written to the file: the declared size grown to fit the voxels, at least 1"""
+        bounds = self.get_bounds()
+        declared = (self.size_x, self.size_y, self.size_z)
+        return tuple(max(1, min(GRID, max(declared[i], bounds[i]))) for i in range(3))
+
     def _default_palette(self) -> List[Tuple[int, int, int, int]]:
-        """Default MagicaVoxel palette (RGBA)"""
-        # First color is always transparent
+        """Default palette (RGBA)"""
+        # Index 0 is empty
         palette = [(0, 0, 0, 0)]
         # Add some basic colors
         basic_colors = [
@@ -46,14 +95,18 @@ class VoxelModel:
         return palette
     
     def set_voxel(self, x: int, y: int, z: int, color_index: int):
-        """Set a voxel at position (x, y, z) with color index"""
-        # Allow placing voxels up to 255 (max for .vox format)
-        # Don't restrict to model size since we want to support large models
-        if 0 <= x <= 255 and 0 <= y <= 255 and 0 <= z <= 255:
-            if color_index > 0:  # 0 is transparent
+        """Set a voxel at position (x, y, z) with color index; 0 removes it.
+        Positions outside the 0-255 grid are dropped and counted in self.clipped."""
+        _check_color(color_index)
+        if 0 <= x < GRID and 0 <= y < GRID and 0 <= z < GRID:
+            if color_index > 0:
+                if len(self.voxels) >= MAX_VOXELS and (x, y, z) not in self.voxels:
+                    raise ValueError(f"Model would exceed {MAX_VOXELS} voxels")
                 self.voxels[(x, y, z)] = color_index
             elif (x, y, z) in self.voxels:
                 del self.voxels[(x, y, z)]
+        elif color_index > 0:
+            self.clipped += 1
     
     def get_voxel(self, x: int, y: int, z: int) -> int:
         """Get color index at position (x, y, z), returns 0 if empty"""
@@ -66,10 +119,29 @@ class VoxelModel:
     
     def fill_box(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int, color_index: int):
         """Fill a box region with voxels"""
-        for x in range(min(x1, x2), max(x1, x2) + 1):
-            for y in range(min(y1, y2), max(y1, y2) + 1):
-                for z in range(min(z1, z2), max(z1, z2) + 1):
+        xs, ys, zs = self._clamp_box((x1, y1, z1), (x2, y2, z2), color_index)
+        for x in xs:
+            for y in ys:
+                for z in zs:
                     self.set_voxel(x, y, z, color_index)
+
+    def _clamp_box(self, lo, hi, color_index: int = 1) -> Tuple[range, range, range]:
+        """Clamp an inclusive box to the grid, noting in self.clipped when it is cut"""
+        spans = tuple(_span(lo[i], hi[i]) for i in range(3))
+        _check_volume(*spans)
+        full = 1
+        for i in range(3):
+            full *= abs(hi[i] - lo[i]) + 1
+        if color_index > 0 and full > len(spans[0]) * len(spans[1]) * len(spans[2]):
+            self.clipped += full - len(spans[0]) * len(spans[1]) * len(spans[2])
+        return spans
+
+    def _region(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> Dict[Tuple[int, int, int], int]:
+        """Voxels inside an inclusive box"""
+        lo = (min(x1, x2), min(y1, y2), min(z1, z2))
+        hi = (max(x1, x2), max(y1, y2), max(z1, z2))
+        return {pos: c for pos, c in self.voxels.items()
+                if all(lo[i] <= pos[i] <= hi[i] for i in range(3))}
     
     def get_voxel_count(self) -> int:
         """Get total number of voxels"""
@@ -83,110 +155,100 @@ class VoxelModel:
         ys = [y for x, y, z in self.voxels.keys()]
         zs = [z for x, y, z in self.voxels.keys()]
         return (max(xs) + 1, max(ys) + 1, max(zs) + 1)
+
+    def get_extent(self) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+        """Inclusive (min, max) corners of the occupied voxels"""
+        keys = self.voxels.keys()
+        lo = tuple(min(p[i] for p in keys) for i in range(3))
+        hi = tuple(max(p[i] for p in keys) for i in range(3))
+        return lo, hi
+
+    def _fill_shape(self, lo, hi, inside, color_index: int, hollow: bool):
+        """Set every voxel in the inclusive box lo..hi for which inside(x, y, z) holds.
+        Hollow keeps only those with a face-neighbour outside the shape. If the box is
+        cut by the grid edge, self.clipped notes it (each shape reaches its box's edges)."""
+        # The grid bounds the loop; set_voxel enforces MAX_VOXELS on what is kept
+        spans = tuple(_span(lo[i], hi[i]) for i in range(3))
+        if any(len(spans[i]) < hi[i] - lo[i] + 1 for i in range(3)):
+            self.clipped += 1
+        for x in spans[0]:
+            for y in spans[1]:
+                for z in spans[2]:
+                    if not inside(x, y, z):
+                        continue
+                    if hollow and all(inside(x + dx, y + dy, z + dz) for dx, dy, dz in NEIGHBORS):
+                        continue
+                    self.set_voxel(x, y, z, color_index)
     
     def create_sphere(self, center_x: int, center_y: int, center_z: int, radius: int, color_index: int, hollow: bool = False):
         """Create a sphere at the specified center with given radius"""
         radius_sq = radius * radius
-        for x in range(center_x - radius, center_x + radius + 1):
-            for y in range(center_y - radius, center_y + radius + 1):
-                for z in range(center_z - radius, center_z + radius + 1):
-                    dx = x - center_x
-                    dy = y - center_y
-                    dz = z - center_z
-                    dist_sq = dx*dx + dy*dy + dz*dz
-                    
-                    if hollow:
-                        # Hollow sphere: only place voxels on the surface
-                        if abs(dist_sq - radius_sq) <= radius:
-                            self.set_voxel(x, y, z, color_index)
-                    else:
-                        # Solid sphere
-                        if dist_sq <= radius_sq:
-                            self.set_voxel(x, y, z, color_index)
+        def inside(x, y, z):
+            return (x - center_x) ** 2 + (y - center_y) ** 2 + (z - center_z) ** 2 <= radius_sq
+        self._fill_shape((center_x - radius, center_y - radius, center_z - radius),
+                         (center_x + radius, center_y + radius, center_z + radius),
+                         inside, color_index, hollow)
     
-    def create_cylinder(self, center_x: int, center_y: int, center_z: int, radius: int, height: int, 
-                       axis: str = 'y', color_index: int = 1, hollow: bool = False):
-        """Create a cylinder. Axis can be 'x', 'y', or 'z'"""
+    def _fill_along_axis(self, origin: Tuple[int, int, int], axis: str, length: int, reach: int,
+                         inside_local, color_index: int, hollow: bool):
+        """Fill a shape described in local (along, u, v) coordinates, where along runs
+        0..length-1 from origin on the axis and u, v run -reach..reach across it."""
+        if axis not in ('x', 'y', 'z'):
+            raise ValueError(f"Axis must be 'x', 'y' or 'z', not {axis!r}")
+        ox, oy, oz = origin
+        along = {'x': 0, 'y': 1, 'z': 2}[axis]
+        across = [i for i in range(3) if i != along]
+        lo, hi = [0, 0, 0], [0, 0, 0]
+        lo[along], hi[along] = origin[along], origin[along] + length - 1
+        for i in across:
+            lo[i], hi[i] = origin[i] - reach, origin[i] + reach
+        def inside(x, y, z):
+            d = (x - ox, y - oy, z - oz)
+            return inside_local(d[along], d[across[0]], d[across[1]])
+        self._fill_shape(lo, hi, inside, color_index, hollow)
+
+    def create_cylinder(self, center_x: int, center_y: int, center_z: int, radius: int, height: int,
+                       axis: str = 'z', color_index: int = 1, hollow: bool = False):
+        """Create a cylinder rising from its base centre along the axis ('x', 'y' or 'z')"""
         radius_sq = radius * radius
-        
-        if axis == 'y':
-            for y in range(center_y, center_y + height):
-                for x in range(center_x - radius, center_x + radius + 1):
-                    for z in range(center_z - radius, center_z + radius + 1):
-                        dx = x - center_x
-                        dz = z - center_z
-                        dist_sq = dx*dx + dz*dz
-                        if hollow:
-                            if abs(dist_sq - radius_sq) <= radius:
-                                self.set_voxel(x, y, z, color_index)
-                        else:
-                            if dist_sq <= radius_sq:
-                                self.set_voxel(x, y, z, color_index)
-        elif axis == 'x':
-            for x in range(center_x, center_x + height):
-                for y in range(center_y - radius, center_y + radius + 1):
-                    for z in range(center_z - radius, center_z + radius + 1):
-                        dy = y - center_y
-                        dz = z - center_z
-                        dist_sq = dy*dy + dz*dz
-                        if hollow:
-                            if abs(dist_sq - radius_sq) <= radius:
-                                self.set_voxel(x, y, z, color_index)
-                        else:
-                            if dist_sq <= radius_sq:
-                                self.set_voxel(x, y, z, color_index)
-        else:  # axis == 'z'
-            for z in range(center_z, center_z + height):
-                for x in range(center_x - radius, center_x + radius + 1):
-                    for y in range(center_y - radius, center_y + radius + 1):
-                        dx = x - center_x
-                        dy = y - center_y
-                        dist_sq = dx*dx + dy*dy
-                        if hollow:
-                            if abs(dist_sq - radius_sq) <= radius:
-                                self.set_voxel(x, y, z, color_index)
-                        else:
-                            if dist_sq <= radius_sq:
-                                self.set_voxel(x, y, z, color_index)
-    
-    def create_pyramid(self, base_x: int, base_y: int, base_z: int, base_width: int, base_depth: int, 
+        def inside(a, u, v):
+            return 0 <= a < height and u * u + v * v <= radius_sq
+        self._fill_along_axis((center_x, center_y, center_z), axis, height, radius,
+                              inside, color_index, hollow)
+
+    def create_pyramid(self, base_x: int, base_y: int, base_z: int, base_width: int, base_depth: int,
                      height: int, color_index: int = 1, hollow: bool = False):
-        """Create a pyramid with rectangular base"""
-        for y in range(height):
-            current_width = int(base_width * (1 - y / height))
-            current_depth = int(base_depth * (1 - y / height))
-            if current_width < 1:
-                current_width = 1
-            if current_depth < 1:
-                current_depth = 1
-            
-            offset_x = (base_width - current_width) // 2
-            offset_z = (base_depth - current_depth) // 2
-            
-            if hollow and y < height - 1:
-                # Hollow: only outline
-                for x in range(base_x + offset_x, base_x + offset_x + current_width):
-                    self.set_voxel(x, base_y + y, base_z + offset_z, color_index)
-                    self.set_voxel(x, base_y + y, base_z + offset_z + current_depth - 1, color_index)
-                for z in range(base_z + offset_z, base_z + offset_z + current_depth):
-                    self.set_voxel(base_x + offset_x, base_y + y, z, color_index)
-                    self.set_voxel(base_x + offset_x + current_width - 1, base_y + y, z, color_index)
-            else:
-                # Solid: fill the layer
-                for x in range(base_x + offset_x, base_x + offset_x + current_width):
-                    for z in range(base_z + offset_z, base_z + offset_z + current_depth):
-                        self.set_voxel(x, base_y + y, z, color_index)
-    
+        """Create a pyramid rising along +Z from a base corner; width runs along X, depth along Y.
+        Each layer is a rectangle centred on the base, shrinking linearly towards the tip."""
+        def inside(x, y, z):
+            layer = z - base_z
+            if not 0 <= layer < height:
+                return False
+            current_width = max(1, int(base_width * (1 - layer / height)))
+            current_depth = max(1, int(base_depth * (1 - layer / height)))
+            x0 = base_x + (base_width - current_width) // 2
+            y0 = base_y + (base_depth - current_depth) // 2
+            return x0 <= x < x0 + current_width and y0 <= y < y0 + current_depth
+        self._fill_shape((base_x, base_y, base_z),
+                         (base_x + base_width - 1, base_y + base_depth - 1, base_z + height - 1),
+                         inside, color_index, hollow)
+
     def replace_color(self, old_color: int, new_color: int):
-        """Replace all voxels of one color with another"""
-        for pos in list(self.voxels.keys()):
-            if self.voxels[pos] == old_color:
-                self.voxels[pos] = new_color
-    
+        """Replace all voxels of one color with another (0 removes them). Returns the count."""
+        _check_color(new_color)
+        matches = [p for p, c in self.voxels.items() if c == old_color]
+        for pos in matches:
+            self.set_voxel(*pos, new_color)
+        return len(matches)
+
     def set_palette_color(self, color_index: int, r: int, g: int, b: int, a: int = 255):
         """Set a specific palette color"""
-        if 0 <= color_index < 256:
-            self.palette[color_index] = (r, g, b, a)
+        if not 1 <= color_index <= 255:
+            raise ValueError(f"Palette index {color_index} is outside 1-255")
+        for component in (r, g, b, a):
+            if not 0 <= component <= 255:
+                raise ValueError(f"Colour component {component} is outside 0-255")
+        self.palette[color_index] = (r, g, b, a)
     
     def count_colors(self) -> dict:
         """Count voxels by color index"""
@@ -198,13 +260,8 @@ class VoxelModel:
     def copy_region(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int, 
                    target_x: int, target_y: int, target_z: int, overwrite: bool = True):
         """Copy a region to another location"""
-        source_voxels = {}
-        for x in range(min(x1, x2), max(x1, x2) + 1):
-            for y in range(min(y1, y2), max(y1, y2) + 1):
-                for z in range(min(z1, z2), max(z1, z2) + 1):
-                    if (x, y, z) in self.voxels:
-                        source_voxels[(x, y, z)] = self.voxels[(x, y, z)]
-        
+        source_voxels = self._region(x1, y1, z1, x2, y2, z2)
+
         # Calculate offset
         offset_x = target_x - min(x1, x2)
         offset_y = target_y - min(y1, y2)
@@ -242,166 +299,45 @@ class VoxelModel:
     
     def clear_region(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int):
         """Remove all voxels in a box region"""
-        for x in range(min(x1, x2), max(x1, x2) + 1):
-            for y in range(min(y1, y2), max(y1, y2) + 1):
-                for z in range(min(z1, z2), max(z1, z2) + 1):
-                    if (x, y, z) in self.voxels:
-                        del self.voxels[(x, y, z)]
-    
-    def create_torus(self, center_x: int, center_y: int, center_z: int, 
-                     major_radius: int, minor_radius: int, 
-                     axis: str = 'y', color_index: int = 1, hollow: bool = False):
+        for pos in self._region(x1, y1, z1, x2, y2, z2):
+            del self.voxels[pos]
+
+    def create_torus(self, center_x: int, center_y: int, center_z: int,
+                     major_radius: int, minor_radius: int,
+                     axis: str = 'z', color_index: int = 1, hollow: bool = False):
         """Create a torus (donut). Major radius is distance from center to tube center,
-        minor radius is tube radius. Axis can be 'x', 'y', or 'z'."""
-        major_r_sq = major_radius * major_radius
+        minor radius is tube radius. The ring lies across the axis ('x', 'y' or 'z')."""
         minor_r_sq = minor_radius * minor_radius
-        
-        # Bounding box
         max_r = major_radius + minor_radius
-        
-        if axis == 'y':
-            for x in range(center_x - max_r, center_x + max_r + 1):
-                for y in range(center_y - minor_radius, center_y + minor_radius + 1):
-                    for z in range(center_z - max_r, center_z + max_r + 1):
-                        dx = x - center_x
-                        dz = z - center_z
-                        dist_from_center = (dx*dx + dz*dz) ** 0.5
-                        if dist_from_center == 0:
-                            continue
-                        
-                        # Distance from torus center circle
-                        dist_from_torus_center = abs(dist_from_center - major_radius)
-                        dy = y - center_y
-                        
-                        dist_sq = dist_from_torus_center * dist_from_torus_center + dy * dy
-                        
-                        if hollow:
-                            if abs(dist_sq - minor_r_sq) <= minor_radius:
-                                self.set_voxel(x, y, z, color_index)
-                        else:
-                            if dist_sq <= minor_r_sq:
-                                self.set_voxel(x, y, z, color_index)
-        elif axis == 'x':
-            for x in range(center_x - minor_radius, center_x + minor_radius + 1):
-                for y in range(center_y - max_r, center_y + max_r + 1):
-                    for z in range(center_z - max_r, center_z + max_r + 1):
-                        dy = y - center_y
-                        dz = z - center_z
-                        dist_from_center = (dy*dy + dz*dz) ** 0.5
-                        if dist_from_center == 0:
-                            continue
-                        
-                        dist_from_torus_center = abs(dist_from_center - major_radius)
-                        dx = x - center_x
-                        
-                        dist_sq = dist_from_torus_center * dist_from_torus_center + dx * dx
-                        
-                        if hollow:
-                            if abs(dist_sq - minor_r_sq) <= minor_radius:
-                                self.set_voxel(x, y, z, color_index)
-                        else:
-                            if dist_sq <= minor_r_sq:
-                                self.set_voxel(x, y, z, color_index)
-        else:  # axis == 'z'
-            for x in range(center_x - max_r, center_x + max_r + 1):
-                for y in range(center_y - max_r, center_y + max_r + 1):
-                    for z in range(center_z - minor_radius, center_z + minor_radius + 1):
-                        dx = x - center_x
-                        dy = y - center_y
-                        dist_from_center = (dx*dx + dy*dy) ** 0.5
-                        if dist_from_center == 0:
-                            continue
-                        
-                        dist_from_torus_center = abs(dist_from_center - major_radius)
-                        dz = z - center_z
-                        
-                        dist_sq = dist_from_torus_center * dist_from_torus_center + dz * dz
-                        
-                        if hollow:
-                            if abs(dist_sq - minor_r_sq) <= minor_radius:
-                                self.set_voxel(x, y, z, color_index)
-                        else:
-                            if dist_sq <= minor_r_sq:
-                                self.set_voxel(x, y, z, color_index)
-    
+        def inside(a, u, v):
+            ring = (u * u + v * v) ** 0.5 - major_radius
+            return ring * ring + (a - minor_radius) ** 2 <= minor_r_sq
+        # The fill runs along the axis from its origin, so start one tube radius below the centre
+        origin = [center_x, center_y, center_z]
+        origin[{'x': 0, 'y': 1, 'z': 2}.get(axis, 2)] -= minor_radius
+        self._fill_along_axis(tuple(origin), axis, 2 * minor_radius + 1, max_r,
+                              inside, color_index, hollow)
+
     def create_cone(self, base_x: int, base_y: int, base_z: int,
                     base_radius: int, height: int,
-                    axis: str = 'y', color_index: int = 1, hollow: bool = False):
-        """Create a cone. Axis can be 'x', 'y', or 'z'."""
-        if axis == 'y':
-            for y in range(height):
-                current_radius = int(base_radius * (1 - y / height))
-                if current_radius < 1:
-                    current_radius = 1
-                
-                radius_sq = current_radius * current_radius
-                
-                for x in range(base_x - base_radius, base_x + base_radius + 1):
-                    for z in range(base_z - base_radius, base_z + base_radius + 1):
-                        dx = x - base_x
-                        dz = z - base_z
-                        dist_sq = dx*dx + dz*dz
-                        
-                        if hollow and y < height - 1:
-                            # Only surface
-                            if abs(dist_sq - radius_sq) <= current_radius:
-                                self.set_voxel(x, base_y + y, z, color_index)
-                        else:
-                            if dist_sq <= radius_sq:
-                                self.set_voxel(x, base_y + y, z, color_index)
-        elif axis == 'x':
-            for x in range(height):
-                current_radius = int(base_radius * (1 - x / height))
-                if current_radius < 1:
-                    current_radius = 1
-                
-                radius_sq = current_radius * current_radius
-                
-                for y in range(base_y - base_radius, base_y + base_radius + 1):
-                    for z in range(base_z - base_radius, base_z + base_radius + 1):
-                        dy = y - base_y
-                        dz = z - base_z
-                        dist_sq = dy*dy + dz*dz
-                        
-                        if hollow and x < height - 1:
-                            if abs(dist_sq - radius_sq) <= current_radius:
-                                self.set_voxel(base_x + x, y, z, color_index)
-                        else:
-                            if dist_sq <= radius_sq:
-                                self.set_voxel(base_x + x, y, z, color_index)
-        else:  # axis == 'z'
-            for z in range(height):
-                current_radius = int(base_radius * (1 - z / height))
-                if current_radius < 1:
-                    current_radius = 1
-                
-                radius_sq = current_radius * current_radius
-                
-                for x in range(base_x - base_radius, base_x + base_radius + 1):
-                    for y in range(base_y - base_radius, base_y + base_radius + 1):
-                        dx = x - base_x
-                        dy = y - base_y
-                        dist_sq = dx*dx + dy*dy
-                        
-                        if hollow and z < height - 1:
-                            if abs(dist_sq - radius_sq) <= current_radius:
-                                self.set_voxel(x, y, base_z + z, color_index)
-                        else:
-                            if dist_sq <= radius_sq:
-                                self.set_voxel(x, y, base_z + z, color_index)
-    
+                    axis: str = 'z', color_index: int = 1, hollow: bool = False):
+        """Create a cone rising from its base centre along the axis ('x', 'y' or 'z')"""
+        def inside(a, u, v):
+            if not 0 <= a < height:
+                return False
+            radius = max(1, int(base_radius * (1 - a / height)))
+            return u * u + v * v <= radius * radius
+        self._fill_along_axis((base_x, base_y, base_z), axis, height, base_radius,
+                              inside, color_index, hollow)
+
     def rotate_region(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int,
                       center_x: int, center_y: int, center_z: int,
                       axis: str, degrees: int):
         """Rotate a region around a center point. Degrees: 90, 180, or 270."""
-        # Extract region voxels
-        region_voxels = {}
-        for x in range(min(x1, x2), max(x1, x2) + 1):
-            for y in range(min(y1, y2), max(y1, y2) + 1):
-                for z in range(min(z1, z2), max(z1, z2) + 1):
-                    if (x, y, z) in self.voxels:
-                        region_voxels[(x, y, z)] = self.voxels[(x, y, z)]
-        
+        if axis not in ('x', 'y', 'z') or degrees not in (90, 180, 270):
+            raise ValueError("Rotation needs axis 'x', 'y' or 'z' and degrees 90, 180 or 270")
+        region_voxels = self._region(x1, y1, z1, x2, y2, z2)
+
         # Clear original region
         for pos in region_voxels:
             del self.voxels[pos]
@@ -450,29 +386,26 @@ class VoxelModel:
             self.set_voxel(new_x, new_y, new_z, color)
     
     def mirror_region(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int,
-                     plane: str, position: int):
-        """Mirror a region across a plane. Plane: 'x', 'y', or 'z'. Position is the plane coordinate."""
-        # Extract region voxels
-        region_voxels = {}
-        for x in range(min(x1, x2), max(x1, x2) + 1):
-            for y in range(min(y1, y2), max(y1, y2) + 1):
-                for z in range(min(z1, z2), max(z1, z2) + 1):
-                    if (x, y, z) in self.voxels:
-                        region_voxels[(x, y, z)] = self.voxels[(x, y, z)]
-        
-        # Mirror and place (set_voxel already checks bounds 0-255)
+                     plane: str, position: float):
+        """Mirror a region across a plane. Plane: 'x', 'y', or 'z'. Position is the plane
+        coordinate; use a .5 position (e.g. 4.5) to mirror between two voxel layers."""
+        if plane not in ('x', 'y', 'z'):
+            raise ValueError(f"Plane must be 'x', 'y' or 'z', not {plane!r}")
+        if (2 * position) % 1:
+            raise ValueError("Mirror position must be a whole or half voxel coordinate")
+        region_voxels = self._region(x1, y1, z1, x2, y2, z2)
+
         for (x, y, z), color in region_voxels.items():
             if plane == 'x':
-                new_x = 2 * position - x
+                new_x = int(2 * position - x)
                 new_y, new_z = y, z
             elif plane == 'y':
-                new_y = 2 * position - y
+                new_y = int(2 * position - y)
                 new_x, new_z = x, z
             else:  # plane == 'z'
-                new_z = 2 * position - z
+                new_z = int(2 * position - z)
                 new_x, new_y = x, y
-            
-            # set_voxel checks bounds (0-255), so this is safe
+
             self.set_voxel(new_x, new_y, new_z, color)
     
     def find_connected_components(self) -> List[Dict]:
@@ -534,11 +467,7 @@ class VoxelModel:
     
     def subtract_region(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int):
         """Remove all voxels in a region (boolean subtract)"""
-        for x in range(min(x1, x2), max(x1, x2) + 1):
-            for y in range(min(y1, y2), max(y1, y2) + 1):
-                for z in range(min(z1, z2), max(z1, z2) + 1):
-                    if (x, y, z) in self.voxels:
-                        del self.voxels[(x, y, z)]
+        self.clear_region(x1, y1, z1, x2, y2, z2)
     
     def union_with_model(self, other_model: 'VoxelModel', offset_x: int = 0, offset_y: int = 0, offset_z: int = 0):
         """Combine this model with another model (boolean union)"""
@@ -557,105 +486,77 @@ class VoxelModel:
             del self.voxels[pos]
     
     def scale_model(self, factor_x: float = 1.0, factor_y: float = 1.0, factor_z: float = 1.0):
-        """Scale the model by factors (can be non-uniform)"""
+        """Scale the model by factors (can be non-uniform). Each voxel becomes the block of
+        target voxels it covers, so scaling up leaves no gaps."""
+        if factor_x <= 0 or factor_y <= 0 or factor_z <= 0:
+            raise ValueError("Scale factors must be greater than 0")
         if factor_x == 1.0 and factor_y == 1.0 and factor_z == 1.0:
             return
-        
-        new_voxels = {}
-        for (x, y, z), color in self.voxels.items():
-            new_x = int(x * factor_x)
-            new_y = int(y * factor_y)
-            new_z = int(z * factor_z)
-            new_voxels[(new_x, new_y, new_z)] = color
-        
-        self.voxels = new_voxels
-        self.size_x = int(self.size_x * factor_x)
-        self.size_y = int(self.size_y * factor_y)
-        self.size_z = int(self.size_z * factor_z)
-    
+
+        def block(c: int, f: float) -> range:
+            start = int(c * f)
+            return range(start, max(start + 1, int((c + 1) * f)))
+
+        old_voxels = self.voxels
+        self.voxels = {}
+        for (x, y, z), color in old_voxels.items():
+            for nx in block(x, factor_x):
+                for ny in block(y, factor_y):
+                    for nz in block(z, factor_z):
+                        self.set_voxel(nx, ny, nz, color)
+
+        self.size_x = min(GRID, int(self.size_x * factor_x))
+        self.size_y = min(GRID, int(self.size_y * factor_y))
+        self.size_z = min(GRID, int(self.size_z * factor_z))
+
     def dilate(self, iterations: int = 1):
         """Dilate: expand surface voxels outward (adds layers)"""
         for _ in range(iterations):
-            new_voxels = dict(self.voxels)
-            for (x, y, z) in self.voxels.keys():
-                # Add neighbors
-                for dx, dy, dz in [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]:
-                    nx, ny, nz = x + dx, y + dy, z + dz
-                    if (nx, ny, nz) not in self.voxels:
-                        new_voxels[(nx, ny, nz)] = self.voxels[(x, y, z)]
-            self.voxels = new_voxels
-    
+            additions = {}
+            for (x, y, z), color in self.voxels.items():
+                for dx, dy, dz in NEIGHBORS:
+                    neighbor = (x + dx, y + dy, z + dz)
+                    if neighbor not in self.voxels:
+                        additions[neighbor] = color
+            for pos, color in additions.items():
+                self.set_voxel(*pos, color)
+
     def erode(self, iterations: int = 1):
         """Erode: remove surface voxels (shrinks model)"""
         for _ in range(iterations):
-            to_remove = []
-            for (x, y, z) in self.voxels.keys():
-                # Check if all neighbors exist (not a surface voxel)
-                all_neighbors = True
-                for dx, dy, dz in [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]:
-                    if (x + dx, y + dy, z + dz) not in self.voxels:
-                        all_neighbors = False
-                        break
-                if all_neighbors:
-                    to_remove.append((x, y, z))
-            for pos in to_remove:
+            for pos in self.get_surface_voxels():
                 del self.voxels[pos]
-    
-    def flood_fill(self, color_index: int = 0):
-        """Fill all hollow interior spaces with color (or remove if color_index=0)"""
+
+    def flood_fill(self, color_index: int = 1):
+        """Fill all enclosed hollow spaces with a color"""
+        if not 1 <= color_index <= 255:
+            raise ValueError("flood_fill needs a color index from 1 to 255")
         if not self.voxels:
             return
-        
-        bounds = self.get_bounds()
-        # Find all empty spaces that are completely enclosed
-        visited = set()
-        to_fill = []
-        
-        # Start from all surface voxels and flood fill outward
-        surface = self.get_surface_voxels()
-        for (x, y, z) in surface:
-            # Check each empty neighbor
-            for dx, dy, dz in [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]:
-                nx, ny, nz = x + dx, y + dy, z + dz
-                if (nx, ny, nz) not in self.voxels and (nx, ny, nz) not in visited:
-                    # Check if this empty space is enclosed
-                    if 0 <= nx < bounds[0] and 0 <= ny < bounds[1] and 0 <= nz < bounds[2]:
-                        # Simple flood fill to check if enclosed
-                        enclosed = True
-                        fill_region = []
-                        stack = [(nx, ny, nz)]
-                        local_visited = set()
-                        
-                        while stack:
-                            cx, cy, cz = stack.pop()
-                            if (cx, cy, cz) in local_visited:
-                                continue
-                            local_visited.add((cx, cy, cz))
-                            fill_region.append((cx, cy, cz))
-                            
-                            # Check boundaries
-                            if not (0 <= cx < bounds[0] and 0 <= cy < bounds[1] and 0 <= cz < bounds[2]):
-                                enclosed = False
-                                break
-                            
-                            # Add neighbors
-                            for ndx, ndy, ndz in [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]:
-                                nnx, nny, nnz = cx + ndx, cy + ndy, cz + ndz
-                                if (nnx, nny, nnz) not in self.voxels and (nnx, nny, nnz) not in local_visited:
-                                    stack.append((nnx, nny, nnz))
-                        
-                        if enclosed:
-                            to_fill.extend(fill_region)
-                            visited.update(local_visited)
-        
-        # Fill or remove
-        for pos in to_fill:
-            if color_index == 0:
-                # Already empty, skip
-                pass
-            else:
-                self.set_voxel(pos[0], pos[1], pos[2], color_index)
-    
+
+        # Flood the empty space outside the model from a box one voxel larger than it;
+        # every empty cell the flood can't reach is enclosed.
+        lo, hi = self.get_extent()
+        lo = tuple(c - 1 for c in lo)
+        hi = tuple(c + 1 for c in hi)
+        _check_volume(*(range(lo[i], hi[i] + 1) for i in range(3)))
+        outside = {lo}
+        queue = deque([lo])
+        while queue:
+            x, y, z = queue.popleft()
+            for dx, dy, dz in NEIGHBORS:
+                n = (x + dx, y + dy, z + dz)
+                if (n not in outside and n not in self.voxels
+                        and all(lo[i] <= n[i] <= hi[i] for i in range(3))):
+                    outside.add(n)
+                    queue.append(n)
+
+        for x in range(lo[0] + 1, hi[0]):
+            for y in range(lo[1] + 1, hi[1]):
+                for z in range(lo[2] + 1, hi[2]):
+                    if (x, y, z) not in self.voxels and (x, y, z) not in outside:
+                        self.set_voxel(x, y, z, color_index)
+
     def shell(self):
         """Remove all interior voxels, keep only surface (hull)"""
         surface = self.get_surface_voxels()
@@ -665,12 +566,15 @@ class VoxelModel:
             del self.voxels[pos]
     
     def invert(self):
-        """Invert: swap solid and empty space within bounds"""
-        bounds = self.get_bounds()
+        """Invert: swap solid and empty space within the occupied bounding box"""
+        if not self.voxels:
+            return
+        lo, hi = self.get_extent()
+        _check_volume(*(range(lo[i], hi[i] + 1) for i in range(3)))
         new_voxels = {}
-        for x in range(bounds[0]):
-            for y in range(bounds[1]):
-                for z in range(bounds[2]):
+        for x in range(lo[0], hi[0] + 1):
+            for y in range(lo[1], hi[1] + 1):
+                for z in range(lo[2], hi[2] + 1):
                     if (x, y, z) not in self.voxels:
                         # Was empty, make solid (use color 1)
                         new_voxels[(x, y, z)] = 1
@@ -678,129 +582,108 @@ class VoxelModel:
         self.voxels = new_voxels
     
     def shrink(self):
-        """Resize model bounds to fit actual voxels (remove empty space)"""
+        """Resize the model to fit its voxels: move them to the origin and trim empty space"""
         if not self.voxels:
             self.size_x = self.size_y = self.size_z = 0
             return
-        
-        bounds = self.get_bounds()
-        self.size_x = bounds[0]
-        self.size_y = bounds[1]
-        self.size_z = bounds[2]
+
+        lo, hi = self.get_extent()
+        self.voxels = {(x - lo[0], y - lo[1], z - lo[2]): c for (x, y, z), c in self.voxels.items()}
+        self.shift = tuple(self.shift[i] - lo[i] for i in range(3))
+        self.size_x, self.size_y, self.size_z = (hi[i] - lo[i] + 1 for i in range(3))
     
     def repeat_pattern(self, count_x: int = 1, count_y: int = 1, count_z: int = 1, mirror: bool = False):
         """Repeat/tile the model pattern across axes"""
         if count_x == 1 and count_y == 1 and count_z == 1:
             return
-        
-        bounds = self.get_bounds()
+        if not self.voxels:
+            return
+
+        lo, hi = self.get_extent()
+        tile = tuple(hi[i] - lo[i] + 1 for i in range(3))
         original_voxels = dict(self.voxels)
-        
-        for tx in range(count_x):
-            for ty in range(count_y):
-                for tz in range(count_z):
+        # Tiles that start past the grid edge can't place anything
+        fits = [-(-(GRID - lo[i]) // tile[i]) for i in range(3)]
+
+        for tx in range(min(count_x, fits[0])):
+            for ty in range(min(count_y, fits[1])):
+                for tz in range(min(count_z, fits[2])):
                     if tx == 0 and ty == 0 and tz == 0:
                         continue  # Skip original
-                    
-                    offset_x = tx * bounds[0] if not mirror or tx % 2 == 0 else tx * bounds[0]
-                    offset_y = ty * bounds[1] if not mirror or ty % 2 == 0 else ty * bounds[1]
-                    offset_z = tz * bounds[2] if not mirror or tz % 2 == 0 else tz * bounds[2]
-                    
+
                     for (x, y, z), color in original_voxels.items():
-                        new_x = x + offset_x
-                        new_y = y + offset_y
-                        new_z = z + offset_z
-                        
-                        if mirror and (tx % 2 == 1 or ty % 2 == 1 or tz % 2 == 1):
-                            # Mirror on odd repetitions
-                            if tx % 2 == 1:
-                                new_x = offset_x + bounds[0] - 1 - x
-                            if ty % 2 == 1:
-                                new_y = offset_y + bounds[1] - 1 - y
-                            if tz % 2 == 1:
-                                new_z = offset_z + bounds[2] - 1 - z
-                        
-                        self.set_voxel(new_x, new_y, new_z, color)
-        
-        self.size_x = bounds[0] * count_x
-        self.size_y = bounds[1] * count_y
-        self.size_z = bounds[2] * count_z
+                        pos = [x, y, z]
+                        for i, t in enumerate((tx, ty, tz)):
+                            if mirror and t % 2 == 1:
+                                # Mirror on odd repetitions
+                                pos[i] = lo[i] + hi[i] - pos[i]
+                            pos[i] += t * tile[i]
+                        self.set_voxel(*pos, color)
+
+        bounds = self.get_bounds()
+        self.size_x, self.size_y, self.size_z = bounds
     
-    def apply_noise(self, seed: int = 0, scale: float = 0.1, min_val: float = 0.0, max_val: float = 1.0):
-        """Apply procedural noise to voxel colors"""
+    def apply_noise(self, seed: int = 0, min_val: float = 0.0, max_val: float = 1.0) -> int:
+        """Nudge voxel colour indices at random: each voxel draws a value in
+        [min_val, max_val], and values above 0.5 raise its index by (value - 0.5) * 10.
+        Returns how many voxels changed colour."""
         import random
         random.seed(seed)
-        
-        # Simple noise: randomize colors within range
+
+        changed = 0
         for (x, y, z) in list(self.voxels.keys()):
             noise_val = random.uniform(min_val, max_val)
             if noise_val > 0.5:  # Threshold for applying noise
                 current_color = self.voxels[(x, y, z)]
-                # Slightly modify color index
                 new_color = max(1, min(255, int(current_color + (noise_val - 0.5) * 10)))
-                self.voxels[(x, y, z)] = new_color
+                if new_color != current_color:
+                    self.voxels[(x, y, z)] = new_color
+                    changed += 1
+        return changed
     
     def randomize_colors(self, min_index: int = 1, max_index: int = 255):
         """Randomize voxel colors within palette range"""
         import random
+        if not 1 <= min_index <= max_index <= 255:
+            raise ValueError("Need 1 <= min_index <= max_index <= 255")
         for (x, y, z) in self.voxels.keys():
             self.voxels[(x, y, z)] = random.randint(min_index, max_index)
     
-    def optimize_palette(self):
-        """Remove unused palette colors and remap"""
-        used_colors = set(self.voxels.values())
-        if 0 in used_colors:
-            used_colors.remove(0)  # Keep transparent
-        
-        # Create mapping from old to new indices
-        color_mapping = {0: 0}  # Keep transparent
-        new_index = 1
-        for old_color in sorted(used_colors):
-            color_mapping[old_color] = new_index
-            new_index += 1
-        
-        # Remap voxels
-        new_voxels = {}
-        for (x, y, z), old_color in self.voxels.items():
-            new_voxels[(x, y, z)] = color_mapping.get(old_color, old_color)
-        self.voxels = new_voxels
-        
-        # Remap palette
-        new_palette = [self.palette[0]]  # Keep transparent
-        for old_color in sorted(used_colors):
-            new_palette.append(self.palette[old_color])
-        # Fill rest
-        while len(new_palette) < 256:
-            new_palette.append((128, 128, 128, 255))
-        self.palette = new_palette
+    def optimize_palette(self) -> int:
+        """Move the colours the model uses to indices 1..N, in their current order, and the
+        unused ones after them. Voxels, palette and MagicaVoxel materials (MATL, keyed by
+        index) are renumbered together, so nothing changes appearance. Refused for files with
+        several models, which share the palette. Returns N."""
+        if self.model_count > 1:
+            raise ValueError("optimize_palette would recolour the file's other models, which share its palette")
+        used = sorted(set(self.voxels.values()))
+        order = used + [i for i in range(1, 256) if i not in set(used)]
+        new_index = {old: new for new, old in enumerate(order, start=1)}
+
+        self.voxels = {pos: new_index[c] for pos, c in self.voxels.items()}
+        self.palette = [self.palette[0]] + [self.palette[old] for old in order]
+        layout = []
+        for item in self.layout:
+            if isinstance(item, bytes) and item[:4] == b'MATL':
+                material = struct.unpack_from('<i', item, 12)[0]
+                if material in new_index:
+                    item = item[:12] + struct.pack('<i', new_index[material]) + item[16:]
+            layout.append(item)
+        self.layout = layout
+        return len(used)
     
     def extrude_region(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int,
                        direction: str, distance: int, color_index: Optional[int] = None):
         """Extrude a region in a direction. Direction: 'x+', 'x-', 'y+', 'y-', 'z+', 'z-'"""
-        # Get original region
-        original_voxels = {}
-        for x in range(min(x1, x2), max(x1, x2) + 1):
-            for y in range(min(y1, y2), max(y1, y2) + 1):
-                for z in range(min(z1, z2), max(z1, z2) + 1):
-                    if (x, y, z) in self.voxels:
-                        original_voxels[(x, y, z)] = self.voxels[(x, y, z)]
-        
-        # Determine offset direction
-        if direction == 'x+':
-            offset = (1, 0, 0)
-        elif direction == 'x-':
-            offset = (-1, 0, 0)
-        elif direction == 'y+':
-            offset = (0, 1, 0)
-        elif direction == 'y-':
-            offset = (0, -1, 0)
-        elif direction == 'z+':
-            offset = (0, 0, 1)
-        else:  # 'z-'
-            offset = (0, 0, -1)
-        
-        # Extrude
-        for step in range(distance):
+        offsets = {'x+': (1, 0, 0), 'x-': (-1, 0, 0), 'y+': (0, 1, 0),
+                   'y-': (0, -1, 0), 'z+': (0, 0, 1), 'z-': (0, 0, -1)}
+        if direction not in offsets:
+            raise ValueError(f"Direction must be one of {', '.join(offsets)}, not {direction!r}")
+        offset = offsets[direction]
+        original_voxels = self._region(x1, y1, z1, x2, y2, z2)
+
+        # Extrude; nothing past the grid edge can land, so stop there
+        for step in range(min(distance, GRID)):
             for (x, y, z), color in list(original_voxels.items()):
                 new_x = x + offset[0] * (step + 1)
                 new_y = y + offset[1] * (step + 1)
@@ -809,69 +692,83 @@ class VoxelModel:
                 self.set_voxel(new_x, new_y, new_z, use_color)
 
 
+def _chunk(chunk_id: bytes, content: bytes, children: bytes = b"") -> bytes:
+    """Encode one .vox chunk: id, content size, children size, content, children"""
+    return chunk_id + struct.pack('<II', len(content), len(children)) + content + children
+
+
 def read_vox_file(filepath: Path) -> VoxelModel:
-    """Read a .vox file and return a VoxelModel"""
-    with open(filepath, 'rb') as f:
-        # Read header
-        magic = f.read(4)
-        if magic != b'VOX ':
-            raise ValueError("Invalid .vox file format")
-        
-        version = struct.unpack('<I', f.read(4))[0]
-        
-        # Read MAIN chunk
-        chunk_id = f.read(4)
-        if chunk_id != b'MAIN':
-            raise ValueError("Expected MAIN chunk")
-        
-        chunk_size = struct.unpack('<I', f.read(4))[0]
-        child_chunks = struct.unpack('<I', f.read(4))[0]
-        
-        # Read SIZE chunk
-        size_id = f.read(4)
-        if size_id != b'SIZE':
-            raise ValueError("Expected SIZE chunk")
-        
-        size_chunk_size = struct.unpack('<I', f.read(4))[0]
-        size_child_chunks = struct.unpack('<I', f.read(4))[0]
-        
-        size_x = struct.unpack('<I', f.read(4))[0]
-        size_y = struct.unpack('<I', f.read(4))[0]
-        size_z = struct.unpack('<I', f.read(4))[0]
-        
-        # Create model with the size from file, but we'll allow placing voxels beyond it
-        model = VoxelModel(size_x, size_y, size_z)
-        
-        # Read XYZI chunk (voxel data)
-        xyzi_id = f.read(4)
-        if xyzi_id == b'XYZI':
-            xyzi_chunk_size = struct.unpack('<I', f.read(4))[0]
-            xyzi_child_chunks = struct.unpack('<I', f.read(4))[0]
-            
-            num_voxels = struct.unpack('<I', f.read(4))[0]
-            
-            for _ in range(num_voxels):
-                x = struct.unpack('<B', f.read(1))[0]
-                y = struct.unpack('<B', f.read(1))[0]
-                z = struct.unpack('<B', f.read(1))[0]
-                color_index = struct.unpack('<B', f.read(1))[0]
-                model.set_voxel(x, y, z, color_index)
-        
-        # Try to read RGBA palette if present
-        rgba_id = f.read(4)
-        if rgba_id == b'RGBA':
-            rgba_chunk_size = struct.unpack('<I', f.read(4))[0]
-            rgba_child_chunks = struct.unpack('<I', f.read(4))[0]
-            
-            palette = []
-            for _ in range(256):
-                r = struct.unpack('<B', f.read(1))[0]
-                g = struct.unpack('<B', f.read(1))[0]
-                b = struct.unpack('<B', f.read(1))[0]
-                a = struct.unpack('<B', f.read(1))[0]
-                palette.append((r, g, b, a))
-            model.palette = palette
-    
+    """Read a .vox file and return a VoxelModel.
+
+    Only the first model in the file is loaded for editing. Every other chunk (further
+    models, the scene graph, layers, materials, cameras) is kept as raw bytes in
+    model.layout, and write_vox_file puts it back unchanged. A file without an RGBA
+    chunk gets this module's default palette, not MagicaVoxel's."""
+    data = Path(filepath).read_bytes()
+    if data[:4] != b'VOX ':
+        raise ValueError("Invalid .vox file format")
+    version = struct.unpack_from('<I', data, 4)[0]
+    if data[8:12] != b'MAIN':
+        raise ValueError("Expected MAIN chunk")
+    main_content = struct.unpack_from('<I', data, 12)[0]
+
+    # MAIN's children run to the end of the file. Older versions of this server wrote
+    # a wrong children size, so it isn't trusted.
+    chunks = []
+    pos = 20 + main_content
+    while pos + 12 <= len(data):
+        chunk_id = data[pos:pos + 4]
+        n_content, n_children = struct.unpack_from('<II', data, pos + 4)
+        end = pos + 12 + n_content + n_children
+        if end > len(data):
+            raise ValueError(f"Chunk {chunk_id!r} at byte {pos} runs past the end of the file")
+        chunks.append((chunk_id, data[pos + 12:pos + 12 + n_content], data[pos:end]))
+        pos = end
+
+    model = None
+    palette = None
+    spare_rgba = bytes(4)
+    layout = []
+    model_count = 0
+    i = 0
+    while i < len(chunks):
+        chunk_id, content, raw = chunks[i]
+        if chunk_id == b'SIZE':
+            model_count += 1
+        if chunk_id == b'SIZE' and model is None:
+            if i + 1 >= len(chunks) or chunks[i + 1][0] != b'XYZI':
+                raise ValueError("SIZE chunk is not followed by XYZI")
+            size_x, size_y, size_z = struct.unpack_from('<III', content)
+            model = VoxelModel(min(size_x, GRID), min(size_y, GRID), min(size_z, GRID))
+            xyzi = chunks[i + 1][1]
+            num_voxels = struct.unpack_from('<I', xyzi)[0]
+            for j in range(num_voxels):
+                x, y, z, color_index = xyzi[4 + 4 * j:8 + 4 * j]
+                if color_index:
+                    model.voxels[(x, y, z)] = color_index
+            layout.append("MODEL")
+            i += 2
+            continue
+        if chunk_id == b'RGBA':
+            # RGBA entry i holds the colour of index i + 1
+            entries = [tuple(content[4 * k:4 * k + 4]) for k in range(256)]
+            palette = [(0, 0, 0, 0)] + entries[:255]
+            spare_rgba = content[1020:1024]
+            layout.append("RGBA")
+        else:
+            layout.append(raw)
+        i += 1
+
+    if model is None:
+        raise ValueError("No model (SIZE and XYZI chunks) in file")
+    if palette is not None:
+        model.palette = palette
+    model.spare_rgba = spare_rgba
+    model.loaded_size = (model.size_x, model.size_y, model.size_z)
+    model.loaded_count = len(model.voxels)
+    model.version = version
+    model.layout = layout
+    model.model_count = model_count
     return model
 
 
@@ -1253,159 +1150,205 @@ def validate_item_density(model: VoxelModel) -> List[str]:
 
 
 def write_vox_file(filepath: Path, model: VoxelModel):
-    """Write a VoxelModel to a .vox file"""
-    with open(filepath, 'wb') as f:
-        # Write header
-        f.write(b'VOX ')
-        f.write(struct.pack('<I', 150))  # Version 150
-        
-        # Calculate chunk sizes
-        # Use the model's declared size, but ensure it's at least as large as the bounds
-        if model.voxels:
-            actual_bounds = model.get_bounds()
-            # Use the larger of declared size or actual bounds
-            size_x = max(model.size_x, actual_bounds[0])
-            size_y = max(model.size_y, actual_bounds[1])
-            size_z = max(model.size_z, actual_bounds[2])
+    """Write a VoxelModel to a .vox file.
+
+    The file is validated and built in memory, written to a temporary file next to the
+    target and then moved over it, so a failure never leaves a half-written model.
+    Returns a note for the user when the model may appear moved in its scene, else None."""
+    for (x, y, z), color_index in model.voxels.items():
+        if not (0 <= x < GRID and 0 <= y < GRID and 0 <= z < GRID):
+            raise ValueError(f"Voxel ({x}, {y}, {z}) is outside the 0-255 grid")
+        if not 1 <= color_index <= 255:
+            raise ValueError(f"Voxel ({x}, {y}, {z}) has color index {color_index}, outside 1-255")
+    if len(model.palette) != 256:
+        raise ValueError(f"Palette has {len(model.palette)} entries, expected 256")
+
+    size = model.file_size()
+    layout, note = _keep_scene_placement(model, size)
+
+    model_chunks = (
+        _chunk(b'SIZE', struct.pack('<III', *size))
+        + _chunk(b'XYZI', struct.pack('<I', len(model.voxels)) + b''.join(
+            struct.pack('<4B', x, y, z, c) for (x, y, z), c in model.voxels.items()))
+    )
+    # RGBA entry i holds the colour of index i + 1; the 256th entry maps to no index
+    rgba_chunk = _chunk(b'RGBA', b''.join(
+        struct.pack('<4B', *model.palette[i]) for i in range(1, 256)) + model.spare_rgba)
+
+    children = []
+    for item in layout:
+        if item == "MODEL":
+            children.append(model_chunks)
+        elif item == "RGBA":
+            children.append(rgba_chunk)
         else:
-            # Use specified size
-            size_x, size_y, size_z = model.size_x, model.size_y, model.size_z
-        
-        num_voxels = len(model.voxels)
-        
-        # SIZE chunk
-        size_chunk_size = 12  # 3 * 4 bytes
-        size_chunk_child = 0
-        
-        # XYZI chunk
-        xyzi_chunk_size = 4 + (num_voxels * 4)  # 4 bytes for count + 4 bytes per voxel
-        xyzi_chunk_child = 0
-        
-        # RGBA chunk
-        rgba_chunk_size = 256 * 4  # 256 colors * 4 bytes
-        rgba_chunk_child = 0
-        
-        # MAIN chunk
-        main_chunk_size = 0  # MAIN chunk contains child chunks
-        main_chunk_child = 8 + size_chunk_size + 8 + xyzi_chunk_size + 8 + rgba_chunk_size
-        
-        # Write MAIN chunk header
-        f.write(b'MAIN')
-        f.write(struct.pack('<I', main_chunk_size))
-        f.write(struct.pack('<I', main_chunk_child))
-        
-        # Write SIZE chunk
-        f.write(b'SIZE')
-        f.write(struct.pack('<I', size_chunk_size))
-        f.write(struct.pack('<I', size_chunk_child))
-        f.write(struct.pack('<I', size_x))
-        f.write(struct.pack('<I', size_y))
-        f.write(struct.pack('<I', size_z))
-        
-        # Write XYZI chunk
-        f.write(b'XYZI')
-        f.write(struct.pack('<I', xyzi_chunk_size))
-        f.write(struct.pack('<I', xyzi_chunk_child))
-        f.write(struct.pack('<I', num_voxels))
-        
-        for (x, y, z), color_index in model.voxels.items():
-            f.write(struct.pack('<B', x))
-            f.write(struct.pack('<B', y))
-            f.write(struct.pack('<B', z))
-            f.write(struct.pack('<B', color_index))
-        
-        # Write RGBA chunk
-        f.write(b'RGBA')
-        f.write(struct.pack('<I', rgba_chunk_size))
-        f.write(struct.pack('<I', rgba_chunk_child))
-        
-        for r, g, b, a in model.palette:
-            f.write(struct.pack('<B', r))
-            f.write(struct.pack('<B', g))
-            f.write(struct.pack('<B', b))
-            f.write(struct.pack('<B', a))
+            children.append(item)
+    if "RGBA" not in layout:
+        children.append(rgba_chunk)
+    data = b'VOX ' + struct.pack('<I', model.version) + _chunk(b'MAIN', b'', b''.join(children))
+
+    filepath = Path(filepath)
+    fd, tmp_path = tempfile.mkstemp(dir=filepath.parent, prefix=f".{filepath.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        os.replace(tmp_path, filepath)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+    return note
+
+
+def _read_string(buf: bytes, pos: int) -> Tuple[str, int]:
+    length = struct.unpack_from('<i', buf, pos)[0]
+    # latin-1 maps every byte, so unknown text round-trips exactly
+    return buf[pos + 4:pos + 4 + length].decode('latin-1'), pos + 4 + length
+
+
+def _read_dict(buf: bytes, pos: int) -> Tuple[Dict[str, str], int]:
+    count = struct.unpack_from('<i', buf, pos)[0]
+    pos += 4
+    result = {}
+    for _ in range(count):
+        key, pos = _read_string(buf, pos)
+        result[key], pos = _read_string(buf, pos)
+    return result, pos
+
+
+def _pack_dict(values: Dict[str, str]) -> bytes:
+    out = struct.pack('<i', len(values))
+    for key, value in values.items():
+        for text in (key, value):
+            encoded = text.encode('latin-1')
+            out += struct.pack('<i', len(encoded)) + encoded
+    return out
+
+
+def _rotate(packed: int, v: Tuple[int, int, int]) -> Tuple[int, int, int]:
+    """Apply a .vox packed rotation (an nTRN frame's _r) to a vector. Bits 0-1 and 2-3 give
+    the column of the non-zero entry in rows 0 and 1; bits 4-6 make rows 0-2 negative."""
+    columns = (packed & 3, (packed >> 2) & 3)
+    columns += (3 - columns[0] - columns[1],)
+    signs = [-1 if packed >> bit & 1 else 1 for bit in (4, 5, 6)]
+    return tuple(signs[row] * v[columns[row]] for row in range(3))
+
+
+def _keep_scene_placement(model: VoxelModel, size: Tuple[int, int, int]) -> Tuple[list, Optional[str]]:
+    """MagicaVoxel places a model in its scene by the model's centre, size // 2. When the
+    first model's size changed, or its voxels were moved (model.shift), move the transforms
+    that place it by the same amount, so its voxels stay where they were in the scene.
+    Returns the layout to write and a note for the user, if any."""
+    if model.loaded_size is None:
+        return model.layout, None
+    delta = tuple(size[i] // 2 - model.loaded_size[i] // 2 - model.shift[i] for i in range(3))
+    if delta == (0, 0, 0):
+        return model.layout, None
+
+    try:
+        # Shape nodes that show model 0, and whether model 0 is one frame of an animation
+        shapes, animated = set(), False
+        for item in model.layout:
+            if isinstance(item, bytes) and item[:4] == b'nSHP':
+                node_id = struct.unpack_from('<i', item, 12)[0]
+                _, pos = _read_dict(item, 16)
+                count = struct.unpack_from('<i', item, pos)[0]
+                pos += 4
+                model_ids = []
+                for _ in range(count):
+                    model_ids.append(struct.unpack_from('<i', item, pos)[0])
+                    _, pos = _read_dict(item, pos + 4)
+                if 0 in model_ids:
+                    shapes.add(node_id)
+                    animated |= count > 1
+        if animated:
+            return model.layout, ("The first model is one frame of an animation; its size changed, "
+                                  "so this frame may appear shifted against the others in MagicaVoxel")
+        if not shapes:
+            return model.layout, None
+
+        layout = []
+        for item in model.layout:
+            if isinstance(item, bytes) and item[:4] == b'nTRN':
+                n_content = struct.unpack_from('<I', item, 4)[0]
+                node_id = struct.unpack_from('<i', item, 12)[0]
+                attributes, pos = _read_dict(item, 16)
+                child, reserved, layer, num_frames = struct.unpack_from('<iiii', item, pos)
+                if child in shapes:
+                    pos += 16
+                    frames = []
+                    for _ in range(num_frames):
+                        frame, pos = _read_dict(item, pos)
+                        offset = _rotate(int(frame.get('_r', '4')), delta)
+                        t = [int(c) for c in frame.get('_t', '0 0 0').split()]
+                        frame['_t'] = ' '.join(str(t[i] + offset[i]) for i in range(3))
+                        frames.append(frame)
+                    content = (struct.pack('<i', node_id) + _pack_dict(attributes)
+                               + struct.pack('<iiii', child, reserved, layer, num_frames)
+                               + b''.join(_pack_dict(frame) for frame in frames))
+                    item = _chunk(b'nTRN', content, item[12 + n_content:])
+            layout.append(item)
+        return layout, None
+    except (struct.error, ValueError):
+        return model.layout, ("Couldn't read the file's scene graph to keep the model in place; "
+                              "it may appear shifted in MagicaVoxel")
 
 
 def render_model_to_image(model: VoxelModel, angle: str, output_path: Path) -> bool:
     """
-    Render a voxel model to an image from a specific angle.
-    
+    Render an orthographic view of a voxel model, Z up.
+
     Args:
         model: The VoxelModel to render
-        angle: One of 'front', 'back', 'left', 'right', 'top', 'bottom'
+        angle: One of 'front' (from -Y), 'back' (+Y), 'left' (-X), 'right' (+X),
+               'top' (+Z) or 'bottom' (-Z)
         output_path: Path to save the image
-    
+
     Returns:
         True if successful, False otherwise
     """
     if not PIL_AVAILABLE:
         return False
-    
+
     if not model.voxels:
         return False
-    
-    bounds = model.get_bounds()
-    
-    # Determine image dimensions and projection based on angle
-    if angle == "front":  # Looking along -Z axis (X, Y visible)
-        width, height = bounds[0], bounds[1]
-        def project(x, y, z):
-            return (x, y)
-    elif angle == "back":  # Looking along +Z axis (X, Y visible, X flipped)
-        width, height = bounds[0], bounds[1]
-        def project(x, y, z):
-            return (bounds[0] - 1 - x, y)
-    elif angle == "left":  # Looking along -X axis (Z, Y visible)
-        width, height = bounds[2], bounds[1]
-        def project(x, y, z):
-            return (z, y)
-    elif angle == "right":  # Looking along +X axis (Z, Y visible, Z flipped)
-        width, height = bounds[2], bounds[1]
-        def project(x, y, z):
-            return (bounds[2] - 1 - z, y)
-    elif angle == "top":  # Looking along -Y axis (X, Z visible)
-        width, height = bounds[0], bounds[2]
-        def project(x, y, z):
-            return (x, z)
-    elif angle == "bottom":  # Looking along +Y axis (X, Z visible, Y flipped)
-        width, height = bounds[0], bounds[2]
-        def project(x, y, z):
-            return (x, bounds[2] - 1 - z)
-    else:
+
+    (x0, y0, z0), (x1, y1, z1) = model.get_extent()
+
+    # Each view maps a voxel to (column, row, depth); the smallest depth is nearest the camera
+    views = {
+        "front": (x1 - x0 + 1, z1 - z0 + 1, lambda x, y, z: (x - x0, z1 - z, y)),
+        "back": (x1 - x0 + 1, z1 - z0 + 1, lambda x, y, z: (x1 - x, z1 - z, -y)),
+        "left": (y1 - y0 + 1, z1 - z0 + 1, lambda x, y, z: (y1 - y, z1 - z, x)),
+        "right": (y1 - y0 + 1, z1 - z0 + 1, lambda x, y, z: (y - y0, z1 - z, -x)),
+        "top": (x1 - x0 + 1, y1 - y0 + 1, lambda x, y, z: (x - x0, y1 - y, -z)),
+        "bottom": (x1 - x0 + 1, y1 - y0 + 1, lambda x, y, z: (x1 - x, y1 - y, z)),
+    }
+    if angle not in views:
         return False
-    
-    # Create image with transparent background
+    width, height, project = views[angle]
+
+    nearest = {}  # (column, row) -> (depth, color_index)
+    for (x, y, z), color_index in model.voxels.items():
+        column, row, depth = project(x, y, z)
+        key = (column, row)
+        if key not in nearest or depth < nearest[key][0]:
+            nearest[key] = (depth, color_index)
+
+    # Shade by depth so holes and recesses show: the farthest surface is drawn at 45% brightness
+    depths = [d for d, _ in nearest.values()]
+    near, span = min(depths), (max(depths) - min(depths)) or 1
+
+    # Draw one pixel per voxel, then scale up so small models are visible
     img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
     pixels = img.load()
-    
-    # Project voxels onto 2D plane (use the closest voxel for each pixel)
-    # For each pixel, find the voxel that projects to it and is closest to camera
-    pixel_voxels = {}  # (px, py) -> (x, y, z, color_index, depth)
-    
-    for (x, y, z), color_index in model.voxels.items():
-        if color_index == 0:  # Skip transparent
-            continue
-        
-        px, py = project(x, y, z)
-        if 0 <= px < width and 0 <= py < height:
-            # Calculate depth for z-buffering
-            if angle in ["front", "back"]:
-                depth = z
-            elif angle in ["left", "right"]:
-                depth = x
-            else:  # top, bottom
-                depth = y
-            
-            key = (px, py)
-            if key not in pixel_voxels or depth > pixel_voxels[key][4]:
-                r, g, b, a = model.palette[color_index]
-                pixel_voxels[key] = (px, py, x, y, z, r, g, b, a, depth)
-    
-    # Draw pixels
-    for (px, py, _, _, _, r, g, b, a, _) in pixel_voxels.values():
-        pixels[px, py] = (r, g, b, a)
-    
-    # Save image
+    for (column, row), (depth, color_index) in nearest.items():
+        r, g, b, a = model.palette[color_index]
+        light = 1 - 0.55 * (depth - near) / span
+        pixels[column, row] = (int(r * light), int(g * light), int(b * light), a)
+    scale = max(1, 256 // max(width, height))
+    img = img.resize((width * scale, height * scale), Image.NEAREST)
+
     try:
         img.save(output_path, 'PNG')
         return True

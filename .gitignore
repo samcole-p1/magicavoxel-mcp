@@ -33,8 +33,8 @@ ENV/
 *.swo
 *~
 
-# MCP Context
-.mcp_context.json
+# Snapshot renders
+export/
 
 # OS
 .DS_Store
