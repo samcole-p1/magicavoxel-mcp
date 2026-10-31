@@ -23,7 +23,7 @@ Any Python 3.10+ works; use its full path in place of `py -3.12` if the launcher
 
 ### In this repo (project scope)
 
-`.mcp.json` at the repo root registers the server for any Claude Code session opened in this folder. Claude Code asks you to approve it the first time. It launches `.venv/Scripts/python.exe server.py`; set `MAGICAVOXEL_PYTHON` to use a different interpreter.
+`.mcp.json` at the repo root registers the server for any Claude Code session opened in this folder. Claude Code asks you to approve it the first time. It launches `.venv/Scripts/python.exe server.py`; set `MAGICAVOXEL_PYTHON` to use a different interpreter (on macOS or Linux, `.venv/bin/python`).
 
 ### From other projects (user scope)
 
