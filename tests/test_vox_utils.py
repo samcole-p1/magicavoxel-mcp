@@ -1,4 +1,4 @@
-"""Regression tests for vox_utils: .vox format, geometry and rendering.
+"""Tests for vox_utils: .vox format, geometry and rendering.
 
 Run from the repo root: .venv\\Scripts\\python -m unittest discover tests
 """
@@ -289,7 +289,7 @@ class SceneTests(TempDirTest):
 
     def test_rotated_transform_moves_by_rotated_offset(self):
         path = self.dir / "s.vox"
-        path.write_bytes(scene_file('17'))  # rows (-y, x, z), as in MagicaVoxel's cars.vox
+        path.write_bytes(scene_file('17'))  # rows (-y, x, z)
         model = read_vox_file(path)
         model.set_voxel(9, 0, 0, 1)  # local offset (3, 0, 0)
         write_vox_file(path, model)

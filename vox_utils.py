@@ -712,8 +712,7 @@ def read_vox_file(filepath: Path) -> VoxelModel:
         raise ValueError("Expected MAIN chunk")
     main_content = struct.unpack_from('<I', data, 12)[0]
 
-    # MAIN's children run to the end of the file. Older versions of this server wrote
-    # a wrong children size, so it isn't trusted.
+    # MAIN's children run to the end of the file; its stored children size isn't relied on.
     chunks = []
     pos = 20 + main_content
     while pos + 12 <= len(data):
