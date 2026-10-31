@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "magicavoxel": {
+      "type": "stdio",
+      "command": "${MAGICAVOXEL_PYTHON:-.venv/Scripts/python.exe}",
+      "args": ["server.py"]
+    }
+  }
+}

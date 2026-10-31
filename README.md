@@ -1,173 +1,100 @@
 # MagicaVoxel MCP Server
 
-An MCP (Model Context Protocol) server for interacting with MagicaVoxel .vox files programmatically. This allows you to create, modify, and manage voxel models through natural language prompts.
+An MCP (Model Context Protocol) server for creating and editing MagicaVoxel `.vox` files. Claude Code calls its tools to place voxels, generate shapes, transform regions and render snapshots.
 
-## Features
+## Requirements
 
-- Create new voxel models with custom dimensions
-- Read and inspect existing .vox files
-- Place individual voxels at specific coordinates
-- Fill rectangular regions with voxels
-- List available models
-- Get detailed model information
-- **Local Machine Learning** - Automatic quality prediction (runs entirely on your machine!)
-- **Intelligent Suggestions** - ML-powered parameter suggestions based on your successful models
-- **Auto-Learning** - System learns from your models and improves over time
+- Python 3.10 or newer (the `mcp` SDK requires it)
+- `mcp` 1.x — the server uses the low-level `Server` decorator API, which was removed in `mcp` 2.x
+- Pillow, optional, for `take_snapshot` PNG renders
 
 ## Installation
 
-1. Install Python dependencies:
+Create a virtual environment in the repo folder and install the dependencies:
+
 ```bash
-cd magicavoxel-mcp
-pip install -r requirements.txt
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-**Note**: The ML features require `scikit-learn`, `numpy`, and `joblib` which are included in requirements.txt. If you only need basic features, the ML system is optional and will gracefully degrade.
+Any Python 3.10+ works; use its full path in place of `py -3.12` if the launcher doesn't list it.
 
-2. Configure the MCP server in your Cursor settings. 
+## Claude Code setup
 
-   In Cursor, go to Settings → Features → Model Context Protocol, and add a new server configuration. You can use the example in `mcp-config-example.json` as a template.
+### In this repo (project scope)
 
-   Update the paths in the configuration to match your system:
-   - `args`: Full path to `server.py`
-   - `VOX_DIR`: Path to your MagicaVoxel `vox/` directory
-   - `EXPORT_DIR`: Path to your MagicaVoxel `export/` directory
+`.mcp.json` at the repo root registers the server for any Claude Code session opened in this folder. Claude Code asks you to approve it the first time. It launches `.venv/Scripts/python.exe server.py`; set `MAGICAVOXEL_PYTHON` to use a different interpreter (on macOS or Linux, `.venv/bin/python`).
 
-   Example configuration:
-```json
-{
-  "mcpServers": {
-    "magicavoxel": {
-      "command": "python",
-      "args": [
-        "C:/Users/Ropbe/Desktop/MagicaVoxel-0.99.7.2-win64/magicavoxel-mcp/server.py"
-      ],
-      "env": {
-        "VOX_DIR": "C:/Users/Ropbe/Desktop/MagicaVoxel-0.99.7.2-win64/vox",
-        "EXPORT_DIR": "C:/Users/Ropbe/Desktop/MagicaVoxel-0.99.7.2-win64/export"
-      }
-    }
-  }
-}
+### From other projects (user scope)
+
+To use the tools from any project, register the server once for your user, with absolute paths:
+
+```bash
+claude mcp add --transport stdio -s user -e VOX_DIR=C:\path\to\MagicaVoxel\vox -e EXPORT_DIR=C:\path\to\MagicaVoxel\export magicavoxel -- E:\magicavoxel-mcp\.venv\Scripts\python.exe E:\magicavoxel-mcp\server.py
 ```
 
-## Usage
+Check it with `claude mcp list`, or `/mcp` inside a session.
 
-Once configured, you can use natural language prompts like:
+### Environment variables
 
-**Basic Operations:**
-- "Create a new voxel model called 'my_model' with dimensions 20x20x20"
-- "Place a voxel at coordinates (10, 10, 10) with color index 1 in my_model"
-- "Fill a box from (0,0,0) to (5,5,5) with color index 2 in my_model"
-- "List all available voxel models"
-- "Show me information about the castle.vox model"
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `VOX_DIR` | `vox/` next to `server.py` | Where models are read and written |
+| `EXPORT_DIR` | `export/` next to `server.py` | Where `take_snapshot` writes renders |
+| `MAGICAVOXEL_PYTHON` | `.venv/Scripts/python.exe` | Interpreter used by `.mcp.json` |
 
-**Shape Generation:**
-- "Create a blue sphere at (15, 15, 15) with radius 8 in my_model"
-- "Create a red cylinder at (10, 0, 10) with radius 5 and height 20 in my_model"
-- "Create a yellow pyramid at (0, 0, 0) with base 10x10 and height 15 in my_model"
+Point `VOX_DIR` at MagicaVoxel's own `vox/` folder to open the results straight from the editor.
 
-**Patterns:**
-- "Create stairs starting at (0, 0, 0) with 10 steps, width 5, depth 3 in my_model"
-- "Create a wall at (0, 0, 0) with length 20, height 10 in my_model"
+## Tools
 
-**Advanced:**
-- "Replace all color 1 voxels with color 4 in my_model"
-- "Set palette color 5 to RGB(255, 128, 0) in my_model"
-- "Count how many voxels of each color are in my_model"
-- "Copy the region from (0,0,0) to (5,5,5) to (10,10,10) in my_model"
+There are 40 tools. Models are named without the `.vox` extension and live in `VOX_DIR`. The server also sends Claude short instructions covering axes, colours and naming.
 
-## Tools Available
+**Models:** `create_voxel_model`, `read_voxel_model`, `get_model_info`, `list_models`, `copy_model`, `delete_model`, `take_snapshot`
 
-### Basic Operations
-- `create_voxel_model` - Create a new empty voxel model with specified dimensions
-- `read_voxel_model` - Read and inspect a .vox file structure
-- `place_voxel` - Place a single voxel at specific coordinates
-- `remove_voxel` - Remove a voxel at specific coordinates
-- `get_voxel` - Get the color index of a voxel at specific coordinates
-- `fill_box` - Fill a rectangular region with voxels
-- `clear_region` - Remove all voxels in a rectangular region
-- `list_models` - List all .vox files in the vox directory
-- `get_model_info` - Get detailed information about a model (dimensions, voxel count, etc.)
-- `delete_model` - Delete a .vox file from the vox directory
-- `copy_model` - Copy a .vox file to a new filename
+**Voxels and regions:** `place_voxel`, `remove_voxel`, `get_voxel`, `fill_box`, `clear_region`, `copy_region`, `rotate_region`, `mirror_region`, `extrude_region`
 
-### Shape Generation
-- `create_sphere` - Create a sphere at specified center with given radius (solid or hollow)
-- `create_cylinder` - Create a cylinder with specified radius, height, and axis direction
-- `create_pyramid` - Create a pyramid with rectangular base (solid or hollow)
-- `create_torus` - Create a torus (donut) shape
-- `create_cone` - Create a cone shape
+**Shapes:** `create_sphere`, `create_cylinder`, `create_pyramid`, `create_torus`, `create_cone`
 
-### Pattern Generation
-- `create_stairs` - Create a staircase with specified number of steps
-- `create_wall` - Create a wall structure in X or Z direction
+**Booleans:** `union_models`, `subtract_region`, `intersect_region`
 
-### Transform Operations
-- `copy_region` - Copy a region of voxels to another location in the same model
-- `move_region` - Move a region to a new location (translates voxels)
-- `rotate_region` - Rotate a region 90, 180, or 270 degrees around an axis
-- `mirror_region` - Mirror a region across a plane
-- `extrude_region` - Extrude a region in a direction
+**Morphology and resizing:** `dilate`, `erode`, `shell`, `invert`, `flood_fill`, `shrink`, `scale_model`, `repeat_pattern`
 
-### Color & Palette Operations
-- `replace_color` - Replace all voxels of one color with another color
-- `set_palette_color` - Set a specific color in the model's palette (RGB values)
-- `get_palette` - Get all palette colors from a model
-- `count_colors` - Count voxels by color index in a model
+**Colour:** `get_palette`, `set_palette_color`, `replace_color`, `randomize_colors`, `apply_noise`, `optimize_palette`
 
-### Model Management
-- `merge_models` - Combine two models into one with optional offset
-
-### Analysis Tools
-- `find_connected_components` - Find all separate connected pieces in a model
-- `get_surface_voxels` - Get all surface (exposed) voxels in a model
-
-### Intelligence Features (Optional)
-- `smart_create_model` - Intelligently create a voxel model with template support
-- `get_suggestions` - Get intelligent suggestions for next operations
-- `get_smart_suggestions` - Get ML-powered parameter suggestions based on learned patterns
-- `list_templates` - List available templates for model creation
-- `get_operation_stats` - Get statistics about operations performed
-- `analyze_item` - Analyze models with automatic validation and ML quality prediction
-- `train_ml_model` - Train local machine learning models from your model history
-- `get_proportion_suggestions` - Get suggested body part proportions for characters
-
-## File Structure
-
-The server works directly with .vox files in the configured `vox/` directory. Changes are saved immediately and can be opened in MagicaVoxel.
+**Analysis:** `find_connected_components`, `get_surface_voxels`
 
 ## Notes
 
-- **Color indices**: Range from 0-255 and correspond to MagicaVoxel's palette. Index 0 is transparent.
-- **Coordinates**: Use (X, Y, Z) format where:
-  - X: Width (left-right)
-  - Y: Height (vertical, up-down)
-  - Z: Depth (front-back)
-- **Model limits**: MagicaVoxel supports models up to 256×256×256 voxels
-- **File format**: The server implements basic .vox file reading/writing. Complex features like materials and animations may require manual editing in MagicaVoxel.
+- **Axes match MagicaVoxel:** X is width, Y is depth, **Z is up**. Shapes rise along +Z by default.
+- Coordinates are 0–255 on each axis. Voxels that land outside the grid are dropped, and the tool result says so.
+- Colour index 0 is empty; 1–255 are palette colours.
+- Each edit reads the file, changes it and writes it back immediately. Writes go to a temporary file that then replaces the original, so a failed edit leaves the file as it was.
+- Model names are bare names inside `VOX_DIR`: letters, digits, spaces, `_`, `-` and `.`, with no paths.
+- One model or operation holds at most 4,194,304 voxels (for example 256×128×128).
+- `create_voxel_model`, `copy_model` and `take_snapshot` refuse to replace an existing file unless you pass `overwrite: true`.
+- `take_snapshot` writes a backup `.vox` and front, back, left, right, top and bottom PNGs into `EXPORT_DIR`, never into `VOX_DIR`. The PNGs are orthographic and shaded by depth, so holes and recesses show darker.
+- Edit results report the voxel count before and after, and say when the model's size changed.
+- New models use a simple default palette: 1 white, 2 red, 3 green, 4 blue, 5 yellow, 6 magenta, 7 cyan, then a grey ramp.
 
-## Direct Function Usage
+## Files saved by MagicaVoxel
 
-**Recommended Approach**: Use MCP tool functions directly via Python one-liners rather than creating standalone scripts.
+The tools edit the first model in a file. Further models, the scene graph (transforms, groups, shapes), layers, materials and cameras are kept byte for byte.
 
-**Example:**
-```python
-# Direct function usage (recommended)
-python -c "import sys; sys.path.insert(0, 'magicavoxel-mcp'); from vox_utils import VoxelModel, write_vox_file; from pathlib import Path; model = VoxelModel(10,10,10); model.fill_box(0,0,0,5,5,5,1); write_vox_file(Path('vox/model.vox'), model)"
+- **Placement:** MagicaVoxel places a model by its centre. When an edit changes the first model's size, or `shrink` moves its voxels, the server moves the model's scene transform to match, so it stays where it was.
+- **Animations:** in an animation file the first model is frame 0 only. Edits change that frame, and a size change can make it jump against the other frames; the tool result says so.
+- **Palette:** all models in a file share one palette, so `optimize_palette` refuses files with several models. On single-model files it renumbers the materials along with the colours, so emissive and glass materials stay on the right voxels.
+- A file without a palette chunk gets this server's default palette rather than MagicaVoxel's.
+
+## Tests
+
+```bash
+.venv\Scripts\python -m unittest discover tests
 ```
 
-**Why:**
-- MCP tools are designed to be used directly through the MCP protocol
-- Direct function calls are faster and more efficient
-- Keeps workflow consistent with MCP tool usage patterns
-- No need for intermediate script files
-
-**Alternative**: You can also use the MCP tools through Cursor's natural language interface, which will call the tools automatically.
+`tests/test_vox_utils.py` covers the file format, geometry and rendering. `tests/test_server.py` starts the server over stdio and drives it with the MCP client.
 
 ## Troubleshooting
 
-- If models don't appear in MagicaVoxel, make sure the `VOX_DIR` path is correct
-- Ensure Python 3.8+ is installed and accessible via the `python` command
-- Check that the MCP server is enabled in Cursor settings
-- Models created programmatically will use a default palette; you can customize colors in MagicaVoxel
+- **Server fails with `'Server' object has no attribute 'list_tools'`**: `mcp` 2.x is installed. Reinstall from `requirements.txt`.
+- **`TypeError: 'type' object is not subscriptable`**: the interpreter is older than 3.10.
+- **Models don't appear in MagicaVoxel**: check that `VOX_DIR` points at the editor's `vox/` folder.
